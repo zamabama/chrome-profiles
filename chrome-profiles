@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Show which Chrome profiles are open, which have Claude in Chrome on, and each one's deviceId.
+
+Match the DEVICE ID column against the deviceIds from list_connected_browsers.
+
+Read-only: Chrome's files are read into memory, without taking Chrome's LOCK file.
+Only the extension fields named in WANTED_KEYS are kept; tokens in that store are skipped.
+"""
+import argparse
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+
+EXTENSION_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+DEFAULT_ROOT = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+LABELS_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "labels.json")
+WANTED_KEYS = {"bridgeDeviceId", "bridgeDisplayName", "accountUuid"}
+LOG_BLOCK_SIZE = 32768
+
+
+# --- LevelDB (the format behind chrome.storage.local) ---
+
+def read_varint(data, pos):
+    result = shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return result, pos
+        shift += 7
+
+
+def snappy_decompress(data):
+    expected, pos = read_varint(data, 0)
+    out = bytearray()
+    while pos < len(data):
+        tag = data[pos]
+        pos += 1
+        kind = tag & 3
+        if kind == 0:
+            length = tag >> 2
+            if length >= 60:
+                extra = length - 59
+                length = int.from_bytes(data[pos:pos + extra], "little")
+                pos += extra
+            length += 1
+            out += data[pos:pos + length]
+            pos += length
+            continue
+        if kind == 1:
+            length = 4 + ((tag >> 2) & 7)
+            offset = ((tag >> 5) << 8) | data[pos]
+            pos += 1
+        else:
+            width = 2 if kind == 2 else 4
+            length = (tag >> 2) + 1
+            offset = int.from_bytes(data[pos:pos + width], "little")
+            pos += width
+        for _ in range(length):  # byte by byte: a copy may overlap its own output
+            out.append(out[-offset])
+    if len(out) != expected:
+        raise ValueError("snappy block has the wrong length")
+    return bytes(out)
+
+
+def table_block(data, offset, size):
+    raw = data[offset:offset + size]
+    compression = data[offset + size]
+    if compression == 0:
+        return raw
+    if compression == 1:
+        return snappy_decompress(raw)
+    raise ValueError(f"unsupported block compression {compression}")
+
+
+def block_entries(block):
+    restarts = struct.unpack("<I", block[-4:])[0]
+    end = len(block) - 4 - 4 * restarts
+    pos = 0
+    key = b""
+    while pos < end:
+        shared, pos = read_varint(block, pos)
+        unshared, pos = read_varint(block, pos)
+        value_len, pos = read_varint(block, pos)
+        key = key[:shared] + block[pos:pos + unshared]
+        pos += unshared
+        yield key, block[pos:pos + value_len]
+        pos += value_len
+
+
+def read_table(data):
+    """Yield (key, sequence, kind, value) from a .ldb file. kind 1 = value, 0 = deletion."""
+    footer = data[-48:]
+    _, pos = read_varint(footer, 0)
+    _, pos = read_varint(footer, pos)
+    index_offset, pos = read_varint(footer, pos)
+    index_size, _ = read_varint(footer, pos)
+    for _, handle in block_entries(table_block(data, index_offset, index_size)):
+        offset, pos = read_varint(handle, 0)
+        size, _ = read_varint(handle, pos)
+        for key, value in block_entries(table_block(data, offset, size)):
+            tag = int.from_bytes(key[-8:], "little")
+            yield key[:-8], tag >> 8, tag & 0xFF, value
+
+
+def log_batches(data):
+    """Reassemble write batches from a .log file's 32KB blocks."""
+    pending = bytearray()
+    pos = 0
+    while pos + 7 <= len(data):
+        left_in_block = LOG_BLOCK_SIZE - pos % LOG_BLOCK_SIZE
+        if left_in_block < 7:
+            pos += left_in_block
+            continue
+        length = struct.unpack("<H", data[pos + 4:pos + 6])[0]
+        record_type = data[pos + 6]
+        pos += 7
+        if record_type == 0:  # preallocated, unwritten space
+            pos += left_in_block - 7
+            continue
+        payload = data[pos:pos + length]
+        pos += length
+        if record_type == 1:  # whole batch
+            yield payload
+        elif record_type == 2:  # first fragment
+            pending = bytearray(payload)
+        elif record_type == 3:  # middle fragment
+            pending += payload
+        elif record_type == 4:  # last fragment
+            pending += payload
+            yield bytes(pending)
+
+
+def read_log(data):
+    """Yield (key, sequence, kind, value) from a .log file."""
+    for batch in log_batches(data):
+        if len(batch) < 12:
+            continue
+        sequence, count = struct.unpack("<QI", batch[:12])
+        pos = 12
+        try:
+            for i in range(count):
+                kind = batch[pos]
+                pos += 1
+                key_len, pos = read_varint(batch, pos)
+                key = batch[pos:pos + key_len]
+                pos += key_len
+                value = b""
+                if kind == 1:
+                    value_len, pos = read_varint(batch, pos)
+                    value = batch[pos:pos + value_len]
+                    pos += value_len
+                yield key, sequence + i, kind, value
+        except IndexError:
+            return  # a write that was cut off at the end of the file
+
+
+def read_store(path, wanted):
+    """Return {key: decoded JSON value} for the `wanted` keys, newest write winning."""
+    wanted_bytes = {key.encode() for key in wanted}
+    newest = {}
+    for name in sorted(os.listdir(path)):
+        if name.endswith(".ldb"):
+            reader = read_table
+        elif name.endswith(".log") and not name.startswith("LOG"):
+            reader = read_log
+        else:
+            continue
+        try:
+            with open(os.path.join(path, name), "rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            continue  # Chrome compacted it away after listdir
+        for key, sequence, kind, value in reader(data):
+            if key in wanted_bytes and (key not in newest or sequence > newest[key][0]):
+                newest[key] = (sequence, kind, value)
+    return {key.decode(): json.loads(value) for key, (_, kind, value) in newest.items() if kind == 1}
+
+
+# --- Which profiles are open ---
+
+def main_pids(ps_output, root):
+    """PIDs of Chrome main processes using this user-data-dir, from `ps -axo pid=,args=`."""
+    is_standard_root = root.rstrip("/").endswith("Application Support/Google/Chrome")
+    pids = []
+    for line in ps_output.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid, args = parts
+        if args != CHROME_BIN and not args.startswith(CHROME_BIN + " "):
+            continue
+        match = re.search(r"--user-data-dir=(.+?)(?= --|$)", args)
+        data_dir = match.group(1).split(" about:")[0] if match else None
+        if data_dir == root or (data_dir is None and is_standard_root):
+            pids.append(pid)
+    return pids
+
+
+def parse_lsof(lsof_output, root):
+    """Top-level names under `root` that appear in `lsof -Fn` output."""
+    prefix = root.rstrip("/") + "/"
+    return {line[1 + len(prefix):].split("/")[0]
+            for line in lsof_output.splitlines()
+            if line.startswith("n" + prefix)}
+
+
+def open_profiles(root):
+    """Folders Chrome currently holds files in, or None if that can't be determined."""
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=10)
+        pids = main_pids(ps.stdout, root)
+        if not pids:
+            return set()
+        lsof = subprocess.run(["lsof", "-n", "-P", "-Fn", "-p", ",".join(pids)],
+                              capture_output=True, text=True, errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_lsof(lsof.stdout, root) if lsof.stdout else None
+
+
+# --- Joining it together ---
+
+def extension_state(secure_preferences):
+    entry = secure_preferences.get("extensions", {}).get("settings", {}).get(EXTENSION_ID)
+    if entry is None:
+        return "none"
+    return "off" if entry.get("disable_reasons") or entry.get("state") == 0 else "on"
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_labels(path):
+    """Read {profile folder: label}. A missing file means no labels; a broken one warns."""
+    try:
+        labels = read_json(path)
+        if not isinstance(labels, dict) or not all(isinstance(v, str) for v in labels.values()):
+            raise ValueError('expected {"Profile folder": "label"}')
+        return labels
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"Ignoring labels file {path}: {e}", file=sys.stderr)
+        return {}
+
+
+def profile_row(root, profile, info, open_dirs, labels):
+    folder = os.path.join(root, profile)
+    errors = []
+
+    extension = "?"
+    try:
+        extension = extension_state(read_json(os.path.join(folder, "Secure Preferences")))
+    except (OSError, ValueError) as e:
+        errors.append(f"Secure Preferences: {e}")
+
+    accounts = [info["user_name"]] if info.get("user_name") else []
+    try:
+        for account in read_json(os.path.join(folder, "Preferences")).get("account_info", []):
+            email = account.get("email")
+            if email and email not in accounts:
+                accounts.append(email)
+    except (OSError, ValueError) as e:
+        errors.append(f"Preferences: {e}")
+
+    storage = {}
+    store = os.path.join(folder, "Local Extension Settings", EXTENSION_ID)
+    if os.path.isdir(store):
+        try:
+            storage = read_store(store, WANTED_KEYS)
+            if "bridgeDeviceId" not in storage:  # Chrome may have been mid-compaction
+                storage = read_store(store, WANTED_KEYS)
+        except (OSError, ValueError, IndexError, struct.error) as e:
+            errors.append(f"extension storage: {e}")
+
+    return {
+        "label": labels.get(profile),
+        "profile": profile,
+        "name": info.get("name", ""),
+        "accounts": accounts,
+        "open": None if open_dirs is None else profile in open_dirs,
+        "extension": extension,
+        "device_id": storage.get("bridgeDeviceId"),
+        "display_name": storage.get("bridgeDisplayName"),
+        "claude_account": storage.get("accountUuid"),
+        "error": "; ".join(errors) or None,
+    }
+
+
+def collect(root, open_dirs, labels=None):
+    labels = labels or {}
+    profiles = read_json(os.path.join(root, "Local State"))["profile"]
+    info_cache = profiles["info_cache"]
+    order = [p for p in profiles.get("profiles_order", []) if p in info_cache]
+    order += [p for p in info_cache if p not in order]
+    return [profile_row(root, p, info_cache[p], open_dirs, labels) for p in order]
+
+
+def visible_rows(rows, show_all):
+    """Labelled profiles in label order; the rest only with --all or when nothing is labelled."""
+    labelled = sorted((r for r in rows if r["label"]), key=lambda r: r["label"])
+    if show_all or not labelled:
+        return labelled + [r for r in rows if not r["label"]]
+    return labelled
+
+
+def render(rows, hidden=0):
+    open_text = {True: "yes", False: "no", None: "?"}
+    headers = ("#", "PROFILE", "NAME", "OPEN", "EXT", "CLAUDE", "DEVICE ID", "GOOGLE ACCOUNTS")
+    table = [headers] + [(
+        r["label"] or "-", r["profile"], r["name"], open_text[r["open"]], r["extension"],
+        (r["claude_account"] or "-")[:8], r["device_id"] or "-", ", ".join(r["accounts"]) or "-",
+    ) for r in rows]
+    widths = [max(len(row[i]) for row in table) for i in range(len(headers) - 1)]
+    lines = ["  ".join([cell.ljust(width) for cell, width in zip(row, widths)] + [row[-1]]) for row in table]
+    lines += [f"{r['profile']}: could not read {r['error']}" for r in rows if r["error"]]
+    lines += ["", "OPEN = Chrome has the profile loaded. CLAUDE = account the extension last signed in as, - = none.",
+              "Which are connected right now: call list_connected_browsers and match DEVICE ID."]
+    if hidden:
+        lines.append(f"{hidden} more profile{'' if hidden == 1 else 's'} not shown: chrome-profiles --all")
+    return "\n".join(lines)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="Chrome profiles, their accounts and Claude in Chrome deviceIds.")
+    parser.add_argument("--json", action="store_true", help="print rows as JSON")
+    parser.add_argument("--all", action="store_true", help="also list profiles with no label")
+    parser.add_argument("--labels", default=LABELS_PATH, help="JSON file of profile folder to your own label")
+    parser.add_argument("--user-data-dir", default=DEFAULT_ROOT, help="Chrome's data folder")
+    args = parser.parse_args(argv)
+    labels = load_labels(args.labels)
+    try:
+        rows = collect(args.user_data_dir, open_profiles(args.user_data_dir), labels)
+    except PermissionError as e:
+        print(f"Can't read Chrome's folder ({e}).\n"
+              "Since macOS 27 this needs Full Disk Access for the app running this command.", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError) as e:
+        print(f"Can't read Chrome's Local State: {e!r}", file=sys.stderr)
+        return 1
+    shown = visible_rows(rows, args.all)
+    print(json.dumps(shown, indent=2) if args.json else render(shown, len(rows) - len(shown)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
